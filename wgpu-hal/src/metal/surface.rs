@@ -1,4 +1,6 @@
-use alloc::borrow::ToOwned as _;
+use alloc::{borrow::ToOwned as _, sync::Arc};
+use core::time::Duration;
+use std::time::Instant;
 
 use objc2::{
     available,
@@ -11,7 +13,7 @@ use objc2_core_graphics::CGColorSpace;
 use objc2_foundation::NSObjectProtocol;
 use objc2_metal::MTLTextureType;
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
-use wgpu_sync::{Lazy, Mutex, RwLock};
+use wgpu_sync::{Condvar, CondvarMutex, Lazy, Mutex, RwLock};
 
 use super::OsFeatures;
 
@@ -32,12 +34,153 @@ fn hosting_window(
     None
 }
 
+/// How long Core Animation may sit on a frame the GPU has finished before `acquire_texture`
+/// calls the surface occluded. A live display needs one refresh, 100 ms on a ProMotion panel
+/// idling at its 10 Hz floor.
+const STALL_BUDGET: Duration = Duration::from_millis(250);
+
+/// How long to wait when the caller names no timeout, matching `wgpu-core`'s.
+const MAX_WAIT: Duration = Duration::from_secs(1);
+
+/// Models the drawable pool of the `CAMetalLayer` a surface renders to.
+///
+/// `nextDrawable` blocks while all the layer's drawables are out, and one only comes back once
+/// Core Animation has displayed it. That wait is the frame pacing and normally ends at the next
+/// refresh, but for a window nothing is drawing it never ends, since `configure` turns
+/// `allowsNextDrawableTimeout` off. See <https://github.com/gfx-rs/wgpu/issues/8309>.
+///
+/// Counting what's out lets the surface do the waiting itself, and the GPU finishing a frame
+/// says when Core Animation became free to display one: still waiting a [`STALL_BUDGET`] later
+/// means nothing is draining the pool. Leaving `allowsNextDrawableTimeout` on instead would be
+/// the three-line version of this, but its timeout is a fixed second on every call, so an
+/// occluded window pays it per frame. [`Pool::stalled`] pays a shorter one once per stall.
+#[derive(Debug, Default)]
+pub(super) struct DrawableTracker {
+    pool: CondvarMutex<Pool>,
+    returned: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct Pool {
+    /// Drawables reserved by `acquire_texture` and not back in the layer's pool yet.
+    outstanding: usize,
+    /// Presented frames the GPU hasn't finished yet.
+    gpu_pending: usize,
+    /// Since when the GPU has owed this surface nothing, so that every outstanding drawable is
+    /// Core Animation's to display. While it still owes one, a wait is the frame taking its
+    /// time, however long that is.
+    gpu_idle_since: Option<Instant>,
+    /// Set when a wait gives up, so the next ones fail instead of parking the caller again.
+    stalled: bool,
+}
+
+impl DrawableTracker {
+    /// Reserves one of the layer's `capacity` drawables, waiting for one if they're all out and
+    /// never longer than `timeout`. Returns whether it got one.
+    pub(super) fn reserve(&self, capacity: usize, timeout: Option<Duration>) -> bool {
+        let mut pool = self.pool.lock();
+        let give_up_at = Instant::now() + timeout.unwrap_or(MAX_WAIT);
+        while pool.outstanding >= capacity {
+            if pool.stalled {
+                return false;
+            }
+            let stall_at = pool.gpu_idle_since.map(|since| since + STALL_BUDGET);
+            if stall_at.is_some_and(|stall_at| stall_at <= Instant::now()) {
+                pool.stalled = true;
+                return false;
+            }
+            // With the GPU still busy, only the caller's deadline bounds this.
+            let deadline = stall_at.map_or(give_up_at, |stall_at| stall_at.min(give_up_at));
+            if self.returned.wait_until(&mut pool, deadline).timed_out()
+                && Instant::now() >= give_up_at
+            {
+                return false;
+            }
+        }
+        pool.outstanding += 1;
+        true
+    }
+
+    /// Gives back a reservation `nextDrawable` handed nothing back for.
+    pub(super) fn unreserve(&self) {
+        let mut pool = self.pool.lock();
+        pool.outstanding = pool.outstanding.saturating_sub(1);
+        self.returned.notify_one();
+    }
+
+    /// Records a drawable going back to the pool, presented or discarded.
+    pub(super) fn released(&self) {
+        let mut pool = self.pool.lock();
+        pool.outstanding = pool.outstanding.saturating_sub(1);
+        pool.stalled = false;
+        self.returned.notify_one();
+    }
+
+    /// Records a presented frame going to the GPU.
+    pub(super) fn gpu_submitted(&self) {
+        let mut pool = self.pool.lock();
+        pool.gpu_pending += 1;
+        pool.gpu_idle_since = None;
+    }
+
+    /// Records the GPU finishing one, leaving Core Animation free to display it.
+    pub(super) fn gpu_completed(&self) {
+        let now = Instant::now();
+        let mut pool = self.pool.lock();
+        pool.gpu_pending = pool.gpu_pending.saturating_sub(1);
+        if pool.gpu_pending == 0 {
+            pool.gpu_idle_since = Some(now);
+            self.returned.notify_one();
+        }
+    }
+
+    /// Forgets what's outstanding, for when the layer builds a new pool.
+    ///
+    /// Undercounting only means `nextDrawable` blocks the way it used to. Overcounting is what
+    /// needs the escape hatch: a presented handler that never runs would wedge the surface.
+    pub(super) fn reset(&self) {
+        *self.pool.lock() = Pool::default();
+        self.returned.notify_all();
+    }
+}
+
+/// Gives a reserved drawable back to its pool when dropped.
+#[derive(Debug)]
+pub(super) struct DrawableReservation(Option<Arc<DrawableTracker>>);
+
+impl DrawableReservation {
+    pub(super) fn new(tracker: Arc<DrawableTracker>) -> Self {
+        Self(Some(tracker))
+    }
+
+    /// Takes over giving the drawable back, for a presented one that only returns once displayed.
+    pub(super) fn disarm(&mut self) -> Option<Arc<DrawableTracker>> {
+        self.0.take()
+    }
+
+    /// Gives the slot back without counting it as a drawable that came back.
+    pub(super) fn cancel(mut self) {
+        if let Some(tracker) = self.0.take() {
+            tracker.unreserve();
+        }
+    }
+}
+
+impl Drop for DrawableReservation {
+    fn drop(&mut self) {
+        if let Some(tracker) = self.0.take() {
+            tracker.released();
+        }
+    }
+}
+
 impl super::Surface {
     pub fn new(layer: Retained<CAMetalLayer>) -> Self {
         Self {
             render_layer: Mutex::new(layer),
             swapchain_format: RwLock::new(None),
             extent: RwLock::new(wgt::Extent3d::default()),
+            drawables: Default::default(),
         }
     }
 
@@ -256,6 +399,9 @@ impl crate::Surface for super::Surface {
         *self.swapchain_format.write() = Some(config.format);
         *self.extent.write() = config.extent;
 
+        // The layer builds a new pool of drawables.
+        self.drawables.reset();
+
         let render_layer = self.render_layer.lock();
         // Metal forbids creating alternate-format views of framebuffer-only textures.
         let framebuffer_only = config.usage == wgt::TextureUses::COLOR_TARGET
@@ -350,33 +496,25 @@ impl crate::Surface for super::Surface {
 
     unsafe fn unconfigure(&self, _device: &super::Device) {
         *self.swapchain_format.write() = None;
+        self.drawables.reset();
     }
 
     unsafe fn acquire_texture(
         &self,
-        _timeout: Option<core::time::Duration>, // TODO
+        timeout: Option<Duration>,
         _fence: &super::Fence,
     ) -> Result<crate::AcquiredSurfaceTexture<super::Api>, crate::SurfaceError> {
-        let render_layer = self.render_layer.lock();
-
-        #[cfg(target_os = "macos")]
-        {
-            // Workaround for https://github.com/gfx-rs/wgpu/issues/8309
-            // When the window is occluded on macOS, presented drawables get stuck waiting
-            // for vsync. Check the window's occlusion state and skip acquisition if
-            // the window is not visible - this avoids a 1-second hang in nextDrawable().
-            use objc2::rc::Retained;
-
-            // The CAMetalLayer is typically a sublayer; find the hosting window
-            // and skip acquisition while it is occluded.
-            if let Some(window) = hosting_window(Retained::into_super(render_layer.clone())) {
-                const NS_WINDOW_OCCLUSION_STATE_VISIBLE: usize = 1 << 1;
-                let occlusion_state: usize = unsafe { objc2::msg_send![&*window, occlusionState] };
-                if occlusion_state & NS_WINDOW_OCCLUSION_STATE_VISIBLE == 0 {
-                    return Err(crate::SurfaceError::Occluded);
-                }
-            }
+        // Claim a drawable before asking for one, so a surface Core Animation has stopped
+        // taking frames from reports occlusion instead of hanging, see `DrawableTracker`.
+        // Read the capacity on its own lock: `reserve` parks, and the main thread needs the
+        // layer for `surface_capabilities`.
+        let capacity = self.render_layer.lock().maximumDrawableCount().max(1);
+        if !self.drawables.reserve(capacity, timeout) {
+            return Err(crate::SurfaceError::Occluded);
         }
+        let reservation = DrawableReservation::new(Arc::clone(&self.drawables));
+
+        let render_layer = self.render_layer.lock();
 
         let (drawable, texture) = match autoreleasepool(|_| {
             render_layer
@@ -384,7 +522,10 @@ impl crate::Surface for super::Surface {
                 .map(|drawable| (drawable.to_owned(), drawable.texture().to_owned()))
         }) {
             Some(pair) => pair,
-            None => return Err(crate::SurfaceError::Timeout),
+            None => {
+                reservation.cancel();
+                return Err(crate::SurfaceError::Timeout);
+            }
         };
 
         let swapchain_format = self.swapchain_format.read().unwrap();
@@ -405,6 +546,7 @@ impl crate::Surface for super::Surface {
             },
             drawable: ProtocolObject::from_retained(drawable),
             present_with_transaction: render_layer.presentsWithTransaction(),
+            return_on_drop: reservation,
         };
 
         Ok(crate::AcquiredSurfaceTexture {
@@ -413,5 +555,7 @@ impl crate::Surface for super::Surface {
         })
     }
 
+    // Dropping the texture releases the drawable back to the layer's pool, and its
+    // `DrawableReservation` accounts for that.
     unsafe fn discard_texture(&self, _texture: super::SurfaceTexture) {}
 }

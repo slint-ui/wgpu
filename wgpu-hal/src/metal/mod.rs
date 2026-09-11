@@ -645,6 +645,8 @@ pub struct Surface {
     render_layer: Mutex<Retained<CAMetalLayer>>,
     swapchain_format: RwLock<Option<wgt::TextureFormat>>,
     extent: RwLock<wgt::Extent3d>,
+    /// Outstanding drawables, so acquisition can bound its wait.
+    drawables: Arc<surface::DrawableTracker>,
 }
 
 unsafe impl Send for Surface {}
@@ -657,6 +659,9 @@ pub struct SurfaceTexture {
     // window resizing.
     drawable: Retained<ProtocolObject<dyn MTLDrawable>>,
     present_with_transaction: bool,
+    /// Declared after `drawable` so dropping this texture releases the drawable before the
+    /// pool hears about it: fields drop in order, and there's no `Drop` here to run first.
+    return_on_drop: surface::DrawableReservation,
 }
 
 impl crate::DynSurfaceTexture for SurfaceTexture {}
@@ -802,14 +807,34 @@ impl crate::Queue for Queue {
     }
     unsafe fn present(
         &self,
-        _surface: &Surface,
-        texture: SurfaceTexture,
+        surface: &Surface,
+        mut texture: SurfaceTexture,
     ) -> Result<(), crate::SurfaceError> {
         autoreleasepool(|_| {
             // We do not bother adjusting `command_buffer_created_not_submitted`
             // because we immediately commit this buffer.
             let command_buffer = self.shared.raw.commandBuffer().unwrap();
             command_buffer.setLabel(Some(ns_string!("(wgpu internal) Present")));
+
+            // Fires once Core Animation has displayed the drawable and the layer can hand it
+            // out again. Must be registered before presenting.
+            if let Some(drawables) = texture.return_on_drop.disarm() {
+                let presented = block2::RcBlock::new(
+                    move |_drawable: NonNull<ProtocolObject<dyn MTLDrawable>>| drawables.released(),
+                );
+                unsafe {
+                    texture
+                        .drawable
+                        .addPresentedHandler(block2::RcBlock::as_ptr(&presented))
+                };
+            }
+
+            // Finishing this frame is what leaves Core Animation free to display it, so it
+            // starts the clock on a pool that stops draining.
+            surface.drawables.gpu_submitted();
+            let drawables = Arc::clone(&surface.drawables);
+            let completed = block2::RcBlock::new(move |_cmd_buf| drawables.gpu_completed());
+            unsafe { command_buffer.addCompletedHandler(block2::RcBlock::as_ptr(&completed)) };
 
             // https://developer.apple.com/documentation/quartzcore/cametallayer/1478157-presentswithtransaction?language=objc
             if !texture.present_with_transaction {

@@ -1011,9 +1011,10 @@ pub enum SurfaceStatus {
     ///
     /// Try reconfiguring your surface.
     Timeout,
-    /// The window is occluded (e.g. minimized or behind another window).
+    /// Nothing is drawing the surface, because the window is minimized, fully occluded or on
+    /// another virtual desktop.
     ///
-    /// Try again once the window is no longer occluded.
+    /// Keep trying: acquisition starts succeeding again on its own once the surface is drawn.
     Occluded,
     /// The surface under the swap chain has changed.
     ///

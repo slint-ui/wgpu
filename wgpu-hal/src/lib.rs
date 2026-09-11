@@ -756,9 +756,11 @@ pub trait Surface: WasmNotSendSync {
     /// Some backends can't support a timeout when acquiring a texture. On these
     /// backends, `timeout` is ignored.
     ///
-    /// On macOS, this returns `Err(SurfaceError::Timeout)` when the window is
-    /// not visible (minimized, fully occluded, or on another virtual desktop)
-    /// to avoid blocking in `CAMetalLayer.nextDrawable()`.
+    /// On Apple platforms, this returns `Err(SurfaceError::Occluded)` instead of
+    /// blocking in `CAMetalLayer.nextDrawable()` once Core Animation stops taking
+    /// frames from the surface, as it does for a minimized or fully occluded
+    /// window. It may give up well before `timeout`, and still reports
+    /// `Err(SurfaceError::Timeout)` if `nextDrawable()` hands nothing back.
     ///
     /// # Safety
     ///

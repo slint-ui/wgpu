@@ -55,10 +55,11 @@ pub enum CurrentSurfaceTexture {
     ///
     /// Applications should skip the current frame and try again later.
     Timeout,
-    /// The window is occluded (e.g. minimized or behind another window).
+    /// Nothing is drawing the surface, because the window is minimized, fully occluded or on
+    /// another virtual desktop.
     ///
-    /// Applications should skip the current frame and try again once the window
-    /// is no longer occluded.
+    /// Applications should skip the current frame and keep trying: acquisition starts
+    /// succeeding again on its own once the surface is drawn.
     Occluded,
     /// The underlying surface has changed, and therefore the surface configuration is outdated.
     ///
