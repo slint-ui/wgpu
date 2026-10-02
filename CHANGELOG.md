@@ -46,6 +46,8 @@ Bottom level categories:
 
 #### Vulkan
 
+- Recover from `VK_ERROR_FRAGMENTED_POOL` and `VK_ERROR_OUT_OF_POOL_MEMORY` when allocating descriptor sets by resetting or retiring the offending pool and retrying on the next available (or a freshly created) pool instead of panicking. By @beicause in [#10264](https://github.com/gfx-rs/wgpu/pull/10264).
+- Fix crash on older Vulkan drivers when `poolSizeCount == 0`. By @lucasmerlin in [#10124](https://github.com/gfx-rs/wgpu/pull/10124).
 - Don't use timeline semaphores on VeriSilicon's proprietary driver, as on NXP's i.MX 8 SoCs, which crashes in `vkQueueSubmit` with them. wgpu falls back to binary fences there. By @tronical in [#10535](https://github.com/gfx-rs/wgpu/pull/10535).
 
 ## v30.0.1 (2026-08-21)
