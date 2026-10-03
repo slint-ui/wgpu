@@ -533,6 +533,16 @@ impl CoreQueue {
         unsafe { self.wgpu_queue.clone().as_hal::<A>() }
     }
 
+    pub unsafe fn as_hal_exclusive<A: hal::Api, F: FnOnce(Option<&A::Queue>) -> R, R>(
+        &self,
+        hal_queue_callback: F,
+    ) -> R {
+        unsafe {
+            self.wgpu_queue
+                .as_hal_exclusive::<A, F, R>(hal_queue_callback)
+        }
+    }
+
     pub(crate) fn from_core(core_queue: Arc<wgc::device::queue::Queue>) -> Self {
         Self {
             wgpu_queue: core_queue,

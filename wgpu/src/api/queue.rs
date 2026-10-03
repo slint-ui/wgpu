@@ -358,6 +358,7 @@ impl Queue {
     ///   is the last reference to it and it is not in use by the GPU.
     ///   The guard and handle may be dropped at any time however.
     /// - All the safety requirements of wgpu-hal must be upheld.
+    ///   To submit or present on the returned queue, use [`Queue::as_hal_exclusive`] instead.
     ///
     /// [`A::Queue`]: hal::Api::Queue
     #[cfg(wgpu_core)]
@@ -366,6 +367,48 @@ impl Queue {
     ) -> Option<impl core::ops::Deref<Target = A::Queue> + WasmNotSendSync> {
         let queue = self.inner.as_core_opt()?;
         unsafe { queue.as_hal::<A>() }
+    }
+
+    /// Call `hal_queue_callback` with the [`wgpu_hal`] queue of this `Queue`,
+    /// while no other thread can submit or present on it.
+    ///
+    /// Use this to submit or present on the raw queue alongside wgpu.
+    /// Some backends require this to be externally synchronized,
+    /// for example `vkQueueSubmit` on Vulkan.
+    /// [`Queue::as_hal`] alone doesn't prevent wgpu from using the queue at the same time.
+    ///
+    /// Calling [`Queue::submit`], [`Queue::present`], or other functions of this queue's device
+    /// from within `hal_queue_callback` may deadlock.
+    ///
+    /// # Errors
+    ///
+    /// This method will pass in [`None`] if:
+    /// - The queue is not from the backend specified by `A`.
+    /// - The queue is from the `webgpu` or `custom` backend.
+    ///
+    /// # Types
+    ///
+    /// The callback argument depends on the backend:
+    ///
+    #[doc = crate::macros::hal_type_vulkan!("Queue")]
+    #[doc = crate::macros::hal_type_metal!("Queue")]
+    #[doc = crate::macros::hal_type_dx12!("Queue")]
+    #[doc = crate::macros::hal_type_gles!("Queue")]
+    ///
+    /// # Safety
+    ///
+    /// - The raw queue handle must not be manually destroyed.
+    /// - All the safety requirements of wgpu-hal must be upheld.
+    #[cfg(wgpu_core)]
+    pub unsafe fn as_hal_exclusive<A: hal::Api, F: FnOnce(Option<&A::Queue>) -> R, R>(
+        &self,
+        hal_queue_callback: F,
+    ) -> R {
+        if let Some(queue) = self.inner.as_core_opt() {
+            unsafe { queue.as_hal_exclusive::<A, F, R>(hal_queue_callback) }
+        } else {
+            hal_queue_callback(None)
+        }
     }
 
     /// Schedule a surface texture to be presented on the owning surface.

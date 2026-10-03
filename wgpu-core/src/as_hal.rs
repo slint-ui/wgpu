@@ -265,6 +265,23 @@ impl crate::device::queue::Queue {
 
         SimpleResourceGuard::new(self, move |queue| queue.raw().as_any().downcast_ref())
     }
+
+    /// Calls `hal_queue_callback` with the raw HAL queue, while no submission or presentation
+    /// can happen on this queue.
+    ///
+    /// # Safety
+    ///
+    /// - The raw queue handle must not be manually destroyed
+    pub unsafe fn as_hal_exclusive<A: hal::Api, F: FnOnce(Option<&A::Queue>) -> R, R>(
+        &self,
+        hal_queue_callback: F,
+    ) -> R {
+        profiling::scope!("Queue::as_hal_exclusive");
+
+        // Submit and present hold the same lock while they use the raw queue.
+        let _command_indices = self.device.command_indices.write();
+        hal_queue_callback(self.raw().as_any().downcast_ref())
+    }
 }
 
 impl crate::resource::Blas {
